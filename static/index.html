@@ -167,6 +167,86 @@
             };
         }
 
+        // Monkeypatch Worker to inject console forwarding
+        const OriginalWorker = Worker;
+        const workerConsoleShim = `
+            const __logMethods = ["trace", "debug", "info", "warn", "error", "log"];
+            for (const __logMethod of __logMethods) {
+                const __stdlog = console[__logMethod].bind(console);
+                console[__logMethod] = function (...args) {
+                    __stdlog(...args);
+                    postMessage({ __wasm_server_runner_log: true, level: __logMethod, args: args.map(a => {
+                        try {
+                            return (typeof a === "object" && a !== null) ? JSON.parse(JSON.stringify(a)) : a;
+                        } catch {
+                            return String(a);
+                        }
+                    })});
+                };
+            }
+            self.onerror = function(msg, src, line, col, error) {
+                postMessage({ __wasm_server_runner_error: true,
+                              message: error ? error.toString() : String(msg) });
+            };
+            self.onunhandledrejection = function(e) {
+                postMessage({ __wasm_server_runner_error: true,
+                              message: e.reason?.toString() || 'Unhandled rejection' });
+            };
+        `;
+
+        function attachWorkerLogInterceptor(worker) {
+            worker.addEventListener("message", function(event) {
+                if (event.data && event.data.__wasm_server_runner_log) {
+                    const item = [event.data.level, event.data.args];
+                    if (websocket.readyState === 1) {
+                        sendLogMessage(item);
+                    } else {
+                        queuedMessages.push(item);
+                    }
+                    event.stopImmediatePropagation();
+                }
+                if (event.data && event.data.__wasm_server_runner_error) {
+                    const item = ["error", [event.data.message]];
+                    if (websocket.readyState === 1) {
+                        sendLogMessage(item);
+                    } else {
+                        queuedMessages.push(item);
+                    }
+                    event.stopImmediatePropagation();
+                }
+            });
+            worker.onerror = function(e) {
+                console.error(e.message || 'Worker error');
+            };
+        }
+
+        // Create a TrustedTypePolicy for our shimmed worker URLs (if Trusted Types supported)
+        const workerPolicy = (typeof trustedTypes !== 'undefined')
+            ? trustedTypes.createPolicy('wasm-server-runner-worker', {
+                createScriptURL: (url) => url
+            })
+            : null;
+
+        function toScriptURL(url) {
+            return workerPolicy ? workerPolicy.createScriptURL(url) : url;
+        }
+
+        Worker = function(scriptURL, options) {
+            const resolvedURL = new URL(scriptURL, location.href).href;
+            const isModule = options?.type === "module";
+
+            // Wrap with import/importScripts to run our shim first
+            const shimCode = isModule
+                ? workerConsoleShim + `\nawait import("${resolvedURL}");`
+                : workerConsoleShim + `\nimportScripts("${resolvedURL}");`;
+            const blob = new Blob([shimCode], { type: "application/javascript" });
+            const workerOptions = isModule ? options : { ...options, type: undefined };
+            const worker = new OriginalWorker(toScriptURL(URL.createObjectURL(blob)), workerOptions);
+            attachWorkerLogInterceptor(worker);
+            return worker;
+        };
+        Worker.prototype = OriginalWorker.prototype;
+
         run();
         startReloadInterval();
     </script>
